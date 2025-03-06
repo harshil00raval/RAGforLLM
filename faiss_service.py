@@ -24,9 +24,17 @@ def create_faiss_index():
     if not docs:
         index = None
         return
+
+    # Encode documents and normalize for cosine similarity
     embeddings = embedding_model.encode(docs)
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(np.array(embeddings))
+
+    # Normalize embeddings for cosine similarity
+    normalized_embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+    # Use IndexFlatIP for inner product (cosine similarity when vectors are normalized)
+    dimension = normalized_embeddings.shape[1]
+    index = faiss.IndexFlatIP(dimension)
+    index.add(normalized_embeddings.astype(np.float32))
 
 @app.post("/add_files/")
 def add_files(req: DirectoryRequest):
@@ -73,14 +81,52 @@ def remove_file(req: FileRequest):
 
     return {"message": f"Removed {req.file_name} from FAISS"}
 
+def normalize(vectors):
+    """Normalize vectors to unit length for cosine similarity."""
+    return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+
 @app.get("/query/")
 def query_faiss(query: str):
-    if not index:
+    global index
+    if index is None:
         raise HTTPException(status_code=400, detail="No documents indexed")
 
+    k = min(5, len(docs))  # Number of closest matches to fetch (limit to available docs)
+    threshold = 0.2  # Cosine similarity threshold (between 0 and 1)
+
+    # Encode and normalize query vector
     query_embedding = embedding_model.encode([query])
-    _, indices = index.search(np.array(query_embedding), 1)
-    return {"file": file_names[indices[0][0]], "content": docs[indices[0][0]]}
+    query_embedding = query_embedding / np.linalg.norm(query_embedding)
+    query_embedding = query_embedding.astype(np.float32)
+
+    # With IndexFlatIP and normalized vectors, scores will be cosine similarities
+    scores, indices = index.search(query_embedding, k)
+
+    # For inner product with normalized vectors, similarity is directly the score
+    # (no need for distance-to-similarity conversion)
+    similarity_scores = scores[0]
+
+    filtered_results = [
+        {
+            "file": file_names[idx],
+            "content": docs[idx][:200] + "..." if len(docs[idx]) > 200 else docs[idx],  # Truncate for display
+            "score": float(round(score, 3))
+        }
+        for idx, score in zip(indices[0], similarity_scores)
+        if idx != -1 and score > threshold
+    ]
+
+    if not filtered_results:
+        return {
+            "message": "No relevant match found above threshold.",
+            "debug_info": {
+                "top_scores": [float(s) for s in similarity_scores],
+                "threshold": threshold,
+                "num_docs_indexed": len(docs)
+            }
+        }
+
+    return {"matches": filtered_results, "total_results": len(filtered_results)}
 
 @app.get("/list_files/")
 def list_files():
